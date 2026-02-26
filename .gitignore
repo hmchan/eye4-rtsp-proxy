@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Compiled shared library (build artifact)
+*.so
+
+# Packet captures (may contain credentials/network data)
+*.pcap
+*.pcapng
+
+# Internal analysis notes
+eye4_protocol_analysis.md
+
+# Config files (contain credentials)
+*.yml
+*.yaml
+!docker-compose.yml
+
+# Claude Code working files
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
