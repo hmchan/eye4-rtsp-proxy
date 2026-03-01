@@ -607,6 +607,26 @@ def build_drw_ack(channel: int, acked_index: int,
     return p2p_proprietary_encrypt(p2p_key, bytes(buf))
 
 
+def build_drw_ack_batch(channel: int, indices: list[int],
+                        p2p_key: bytes, enc_mode: str = ENC_P2P) -> bytes:
+    """Build a batched DRW_ACK packet for multiple indices at once.
+    The Eye4 app sends batched ACKs with count=N and N index entries."""
+    count = len(indices)
+    inner_size = 4 + count * 2  # D1 + channel + count16 + N*idx16
+    buf = bytearray(4 + inner_size)
+    buf[0] = PPPP_MAGIC
+    buf[1] = MSG_DRW_ACK
+    struct.pack_into('>H', buf, 2, inner_size)
+    buf[4] = DRW_ACK_INNER_MAGIC
+    buf[5] = channel
+    struct.pack_into('>H', buf, 6, count)
+    for i, idx in enumerate(indices):
+        struct.pack_into('>H', buf, 8 + i * 2, idx)
+    if enc_mode == ENC_XOR_ONLY:
+        return xor_obfuscate(bytes(buf))
+    return p2p_proprietary_encrypt(p2p_key, bytes(buf))
+
+
 def build_cgi_command(cgi_text: str) -> bytes:
     """Wrap a CGI command string in the binary envelope expected by the camera."""
     cgi_bytes = cgi_text.encode("ascii")
@@ -716,6 +736,11 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._raw_drw_enc_modes: list[str] = []  # Track which enc mode each buffered pkt uses
         self._lan_notify_raw: dict[str, tuple[bytes, tuple]] = {}  # ip -> (raw, addr)
 
+        # Batched ACK state — camera expects multi-index ACK packets
+        self._pending_acks: dict[int, list[int]] = {}  # channel -> [indices]
+        self._ack_addr: Optional[tuple] = None  # address to send ACKs to
+        self._ack_flush_task: Optional[asyncio.Task] = None
+
         self.aes_key: Optional[bytes] = None
 
     def connection_made(self, transport):
@@ -724,6 +749,22 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         if sock:
             local = sock.getsockname()
             log.info("PPPP socket bound to %s:%d", local[0], local[1])
+
+    def _flush_acks_for_channel(self, channel: int, addr: tuple):
+        """Send a batched ACK for all pending indices on a channel."""
+        indices = self._pending_acks.pop(channel, [])
+        if not indices or not self.transport or self.transport.is_closing():
+            return
+        ack = build_drw_ack_batch(channel, indices, self.p2p_key, self.enc_mode)
+        self.transport.sendto(ack, addr)
+
+    def _flush_all_acks_timer(self):
+        """Flush all pending ACKs across all channels (called by timer)."""
+        self._ack_flush_task = None  # Allow new timer to be scheduled
+        if not self._ack_addr:
+            return
+        for channel in list(self._pending_acks.keys()):
+            self._flush_acks_for_channel(channel, self._ack_addr)
 
     def datagram_received(self, data: bytes, addr: tuple):
         if len(data) < 4:
@@ -768,17 +809,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             pass  # Ignore our own broadcasts
         elif xor_type == 0x20:
             if self._active_camera and ip == self._active_camera.ip:
-                now = asyncio.get_event_loop().time()
-                last_drw = getattr(self, '_last_drw_time', 0)
-                drw_age = now - last_drw if last_drw > 0 else float('inf')
-                if drw_age < 5.0:
-                    # DRW data still flowing recently — ignore CLOSE from subsidiary port
-                    log.debug("CLOSE (0x20) from %s:%d — ignoring, DRW active %.1fs ago",
-                              ip, port, drw_age)
+                # Only treat CLOSE as meaningful if it's from the active DRW port
+                if self._drw_port and port != self._drw_port:
+                    log.debug("CLOSE (0x20) from %s:%d — not DRW port (%d), ignoring",
+                              ip, port, self._drw_port)
                 else:
-                    log.warning("CLOSE (0x20) from %s:%d — DRW stale (%.1fs), scheduling reconnect",
-                                ip, port, drw_age)
-                    asyncio.ensure_future(self._handle_session_close())
+                    now = asyncio.get_event_loop().time()
+                    last_drw = getattr(self, '_last_drw_time', 0)
+                    drw_age = now - last_drw if last_drw > 0 else float('inf')
+                    if drw_age < 15.0:
+                        log.debug("CLOSE (0x20) from %s:%d — DRW active %.1fs ago, ignoring",
+                                  ip, port, drw_age)
+                    else:
+                        log.warning("CLOSE (0x20) from %s:%d — DRW stale (%.1fs), scheduling reconnect",
+                                    ip, port, drw_age)
+                        asyncio.ensure_future(self._handle_session_close())
             else:
                 log.debug("CLOSE (0x20) from %s:%d (not active camera)", ip, port)
         else:
@@ -878,11 +923,22 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
 
         # Track time of last DRW received (for reconnect debounce)
         self._last_drw_time = asyncio.get_event_loop().time()
+        if channel == 1:
+            self._last_video_drw_time = self._last_drw_time
 
-        # Always ACK immediately (even retransmissions)
-        if self.transport and not self.transport.is_closing():
-            ack = build_drw_ack(channel, index, self.p2p_key, self.enc_mode)
-            self.transport.sendto(ack, addr)
+        # Queue ACK for batched sending (camera expects multi-index ACKs)
+        self._ack_addr = addr
+        if channel not in self._pending_acks:
+            self._pending_acks[channel] = []
+        self._pending_acks[channel].append(index)
+        # Flush when we have enough indices or for command channel (ACK immediately)
+        if channel == 0 or len(self._pending_acks[channel]) >= 16:
+            self._flush_acks_for_channel(channel, addr)
+        else:
+            # Schedule a flush timer if one isn't already pending
+            if self._ack_flush_task is None:
+                self._ack_flush_task = asyncio.get_event_loop().call_later(
+                    0.05, self._flush_all_acks_timer)
 
         # Track seen indices — skip retransmissions for processing
         # Uses a sliding window to handle 16-bit index wraparound (0-65535)
@@ -1032,19 +1088,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
     def _on_video_frame(self, frame_type: int, timestamp: int, data: bytes):
         # Video data is NOT AES-encrypted after P2P_Proprietary decryption
         # (confirmed from pcap: STREAMHEAD + raw H.264 NALs)
-        if self._video_reassembly and self._video_reassembly._frames_received <= 3:
+        n = self._video_reassembly._frames_received if self._video_reassembly else 0
+        if n <= 3 or n % 100 == 0:
             log.info("Video frame #%d: type=%d size=%d first32=%s",
-                     self._video_reassembly._frames_received, frame_type,
-                     len(data), data[:32].hex() if data else "empty")
-            # Check for NAL start codes
-            if data[:4] == b'\x00\x00\x00\x01':
-                nal_type = data[4] & 0x1F
-                log.info("  H.264 NAL type=%d (4-byte start code)", nal_type)
-            elif data[:3] == b'\x00\x00\x01':
-                nal_type = data[3] & 0x1F
-                log.info("  H.264 NAL type=%d (3-byte start code)", nal_type)
-            else:
-                log.info("  No standard NAL start code! first4=%s", data[:4].hex())
+                     n, frame_type, len(data),
+                     data[:32].hex() if data else "empty")
+            if n <= 3:
+                if data[:4] == b'\x00\x00\x00\x01':
+                    nal_type = data[4] & 0x1F
+                    log.info("  H.264 NAL type=%d (4-byte start code)", nal_type)
+                elif data[:3] == b'\x00\x00\x01':
+                    nal_type = data[3] & 0x1F
+                    log.info("  H.264 NAL type=%d (3-byte start code)", nal_type)
         if self.video_callback:
             self.video_callback(frame_type, timestamp, data)
 
@@ -1310,9 +1365,9 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         The camera tracks sessions by source port, so we need a new socket."""
         if not self._running or not self._active_camera:
             return
-        # Debounce: only reconnect once per 3 seconds
+        # Debounce: only reconnect once per 15 seconds
         now = asyncio.get_event_loop().time()
-        if hasattr(self, '_last_reconnect') and now - self._last_reconnect < 3:
+        if hasattr(self, '_last_reconnect') and now - self._last_reconnect < 15:
             return
         self._last_reconnect = now
 
@@ -1326,6 +1381,12 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._cmd_index = 0
         self._drw_packets_received = 0
         self._drw_bytes_received = 0
+        self._last_video_drw_time = 0
+        self._video_rerequests = 0
+        self._pending_acks.clear()
+        if self._ack_flush_task:
+            self._ack_flush_task.cancel()
+            self._ack_flush_task = None
         self._got_any_drw.clear()
 
         # Close old transport and create new one
@@ -1392,42 +1453,48 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
 
     async def _video_keepalive_loop(self):
         """Periodically re-request video stream to keep it flowing.
-        If the stream dies for too long, trigger a full reconnect."""
+        Camera sends ~3 frames per livestream.cgi request, so we re-request
+        frequently to maintain near-continuous video.
+        Does NOT trigger full reconnects — that's CameraSession's job."""
         self._video_rerequests = 0
         while self._running:
             await asyncio.sleep(1)  # Check every 1 second
             if not (self._active_camera and self.enc_mode):
                 continue
             now = asyncio.get_event_loop().time()
-            last_drw = getattr(self, '_last_drw_time', 0)
-            # If we had video but it stopped for 2+ seconds, re-request on same session
-            if last_drw > 0 and now - last_drw > 2:
-                gap = now - last_drw
-                if gap > 10 and self._video_rerequests >= 2:
-                    # Stream dead for 10+s despite re-requests — full reconnect needed
-                    log.warning("Video dead for %.1fs after %d re-requests, full reconnect",
-                                gap, self._video_rerequests)
-                    self._video_rerequests = 0
-                    asyncio.ensure_future(self._handle_session_close())
-                else:
-                    self._video_rerequests += 1
-                    log.info("Video keepalive: re-requesting streams (gap=%.1fs, attempt=%d)",
+            last_video = getattr(self, '_last_video_drw_time', 0)
+            # If video stopped for 1+ second, re-request (camera needs periodic requests)
+            if last_video > 0 and now - last_video > 1:
+                gap = now - last_video
+                self._video_rerequests += 1
+                if self._video_rerequests <= 30:
+                    # Re-request video quietly (this is normal operation, not an error)
+                    log.debug("Video keepalive: re-requesting video (gap=%.1fs, attempt=%d)",
+                              gap, self._video_rerequests)
+                    await self._send_start_video()
+                elif self._video_rerequests % 10 == 0:
+                    # Log occasionally after many attempts
+                    log.info("Video keepalive: re-requesting video+audio (gap=%.1fs, attempt=%d)",
                              gap, self._video_rerequests)
                     await self._send_start_video()
                     await self._send_start_audio()
-            elif last_drw > 0 and now - last_drw <= 2:
-                # Stream is healthy, reset re-request counter
-                self._video_rerequests = 0
-                # Check if audio went stale while video is still flowing
-                # Camera sends audio in short bursts (~5 packets) then stops,
-                # so use a short threshold to re-request quickly.
-                last_audio = getattr(self, '_last_audio_drw_time', 0)
-                if last_audio > 0 and now - last_audio > 1.5:
+                else:
+                    await self._send_start_video()
+            elif last_video > 0 and now - last_video <= 1:
+                # Video stream is active, reset counter
+                if self._video_rerequests > 0:
+                    self._video_rerequests = 0
+            # Check if audio went stale (separate from video)
+            last_audio = getattr(self, '_last_audio_drw_time', 0)
+            if last_audio > 0 and now - last_audio > 3:
+                last_drw = getattr(self, '_last_drw_time', 0)
+                if last_drw > 0 and now - last_drw < 3:
                     log.info("Audio keepalive: re-requesting audio (audio gap=%.1fs)",
                              now - last_audio)
                     await self._send_start_audio()
             # If we never received DRW data and session is old, re-request
-            elif last_drw == 0 and hasattr(self, '_session_start'):
+            last_drw = getattr(self, '_last_drw_time', 0)
+            if last_drw == 0 and hasattr(self, '_session_start'):
                 if now - self._session_start > 5:
                     log.info("Video keepalive: no data yet, re-requesting...")
                     self._session_start = now  # Reset to avoid spam
@@ -1442,8 +1509,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         await self._send_cmd(cgi)
 
     async def _send_start_video(self):
-        # streamid=10 = main stream (HEVC/H.265 confirmed working)
-        # streamid=0 does NOT trigger video on these cameras
+        # streamid=10 = main stream (H.264, 1080p)
         cgi = (f"GET /livestream.cgi?"
                f"streamid=10&substream=1"
                f"&loginuse={self.username}&loginpas={self.password}"
@@ -1809,13 +1875,12 @@ class AudioReassembly:
             # Camera resets ADPCM state (predictor=0, index=0) at each frame
             # boundary — do NOT carry state across frames or the decoder diverges.
             pcm_le, _, _ = decode_ima_adpcm(data, 0, 0)
-            # Byte-swap LE → BE for RTP L16 (network byte order)
-            pcm_be = _array.array('h')
-            pcm_be.frombytes(pcm_le)
-            pcm_be.byteswap()
-            pcm_be = pcm_be.tobytes()
-            self.detected_codec = AUDIO_PCM_L16
-            self.frame_callback(bytes(pcm_be), AUDIO_PCM_L16)
+            # Convert to G.711 µ-law for universal compatibility.
+            # L16 (dynamic PT 97) is not detected by ffmpeg over RTSP/TCP,
+            # but PCMU (static PT 0) is universally supported.
+            ulaw = pcm16le_to_ulaw(pcm_le)
+            self.detected_codec = AUDIO_PCMU
+            self.frame_callback(ulaw, AUDIO_PCMU)
         elif codec_byte == AUDIO_CODEC_G711A:
             self.detected_codec = AUDIO_PCMA
             self.frame_callback(data, AUDIO_PCMA)
@@ -2033,11 +2098,11 @@ class CameraSession:
             gap = now - self._last_drw_time if self._last_drw_time > 0 else 0
 
             if self.state == STATE_CONNECTED:
-                if gap > 15:
+                if gap > 30:
                     log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.uid, gap)
                     self.state = STATE_OFFLINE
                     stale_logged = False
-                elif gap > 5:
+                elif gap > 10:
                     if not stale_logged:
                         log.info("[%s] No data for %.0fs — STALE, re-requesting video",
                                  self.camera.uid, gap)
@@ -2051,11 +2116,11 @@ class CameraSession:
                     self.state = STATE_CONNECTED
 
             elif self.state == STATE_STALE:
-                if gap <= 2:
+                if gap <= 5:
                     log.info("[%s] Video resumed — CONNECTED", self.camera.uid)
                     self.state = STATE_CONNECTED
                     stale_logged = False
-                elif gap > 15:
+                elif gap > 30:
                     log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.uid, gap)
                     self.state = STATE_OFFLINE
 
@@ -2066,59 +2131,30 @@ class CameraSession:
                 if self.rtsp:
                     self.rtsp._cached_iframe = None
                 self.state = STATE_RECONNECTING
+                # Wait before first reconnect to let camera sessions expire
+                # and stagger reconnects across cameras
+                import random
+                jitter = random.uniform(5, 15)
+                log.info("[%s] Waiting %.0fs before reconnect attempt...", self.camera.uid, jitter)
+                await asyncio.sleep(jitter)
 
             elif self.state == STATE_RECONNECTING:
                 log.info("[%s] Attempting reconnect to %s...", self.camera.uid, self.camera.ip)
                 try:
                     await self._attempt_reconnect()
                 except Exception as e:
-                    log.warning("[%s] Reconnect failed: %s — retrying in 10s", self.camera.uid, e)
-                    await asyncio.sleep(5)  # Extra backoff (total ~10s with loop sleep)
+                    log.warning("[%s] Reconnect failed: %s — retrying in 15s", self.camera.uid, e)
+                    await asyncio.sleep(10)  # Extra backoff (total ~15s with loop sleep)
 
     async def _attempt_reconnect(self):
-        """Try to rediscover and reconnect to the camera."""
-        # Create a temporary protocol just for discovery
-        loop = asyncio.get_event_loop()
-        probe = PPPPUnifiedProtocol(
-            username=self.username, password=self.password)
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: probe,
-            local_addr=("0.0.0.0", 0),
-            allow_broadcast=True,
-        )
-        sock = transport.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        search_pkt = build_lan_search()
-        # Send directed + broadcast
-        transport.sendto(search_pkt, (self.camera.ip, PPPP_PORT))
-        for bcast in get_broadcast_addresses():
-            try:
-                transport.sendto(search_pkt, (bcast, PPPP_PORT))
-            except OSError:
-                pass
-
-        # Wait for response
-        await asyncio.sleep(3)
-        transport.close()
-
-        # Check if our camera responded
-        found = False
-        for ip, cam in probe.cameras.items():
-            if cam.uid == self.camera.uid:
-                self.camera.ip = ip
-                self.camera.port = cam.port
-                self.camera.discovery_port = cam.discovery_port
-                found = True
-                break
-
-        if not found:
-            log.info("[%s] Camera not found on LAN — still offline", self.camera.uid)
-            return
-
-        log.info("[%s] Camera found at %s — reconnecting!", self.camera.uid, self.camera.ip)
-        await self._create_and_connect()
+        """Try to reconnect to the camera using its last known address.
+        Avoids creating probe sessions that count against camera's user limit."""
+        log.info("[%s] Reconnecting directly to %s (no probe)...",
+                 self.camera.uid, self.camera.ip)
+        try:
+            await self._create_and_connect()
+        except Exception as e:
+            log.warning("[%s] Direct reconnect failed: %s", self.camera.uid, e)
 
 
 # =============================================================================
@@ -2601,6 +2637,7 @@ class RTSPServer:
                 f"o=- {int(time.time())} 1 IN IP4 {client_ip}\r\n"
                 "s=Eye4 Camera\r\n"
                 "t=0 0\r\n"
+                "a=range:npt=0-\r\n"
                 "m=video 0 RTP/AVP 96\r\n"
                 "c=IN IP4 0.0.0.0\r\n"
                 "a=rtpmap:96 H265/90000\r\n"
@@ -2624,6 +2661,7 @@ class RTSPServer:
                 f"o=- {int(time.time())} 1 IN IP4 {client_ip}\r\n"
                 "s=Eye4 Camera\r\n"
                 "t=0 0\r\n"
+                "a=range:npt=0-\r\n"
                 "m=video 0 RTP/AVP 96\r\n"
                 "c=IN IP4 0.0.0.0\r\n"
                 "a=rtpmap:96 H264/90000\r\n"
@@ -2699,6 +2737,13 @@ class RTSPClient:
             elif method == "TEARDOWN":
                 await self._send_teardown()
                 break
+            elif method in ("GET_PARAMETER", "SET_PARAMETER"):
+                # Keepalive — return 200 OK (Scrypted and other clients use this)
+                resp = (f"RTSP/1.0 200 OK\r\n"
+                        f"CSeq: {self._cseq}\r\n"
+                        f"Session: {self._session_id}\r\n\r\n")
+                self.writer.write(resp.encode())
+                await self.writer.drain()
             else:
                 await self._send_response(405, "Method Not Allowed")
 
@@ -2752,7 +2797,7 @@ class RTSPClient:
     async def _send_options(self):
         resp = (f"RTSP/1.0 200 OK\r\n"
                 f"CSeq: {self._cseq}\r\n"
-                f"Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n")
+                f"Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n")
         self.writer.write(resp.encode())
         await self.writer.drain()
 
@@ -2760,10 +2805,11 @@ class RTSPClient:
         addr = self.writer.get_extra_info("sockname")
         server_ip = addr[0] if addr else "127.0.0.1"
         sdp = self.server.get_sdp(server_ip)
+        content_base = uri.rstrip("/") + "/"
         resp = (f"RTSP/1.0 200 OK\r\n"
                 f"CSeq: {self._cseq}\r\n"
                 f"Content-Type: application/sdp\r\n"
-                f"Content-Base: {uri}/\r\n"
+                f"Content-Base: {content_base}\r\n"
                 f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
         self.writer.write(resp.encode())
         await self.writer.drain()
@@ -2823,12 +2869,16 @@ class RTSPClient:
     async def _send_play(self):
         self.playing = True
         self.got_iframe = False  # Wait for next I-frame before sending video
+        rtp_info = (f"url=streamid=0;seq={self.server._rtp_seq};"
+                    f"rtptime={self.server._rtp_ts}")
+        if self.audio_setup:
+            rtp_info += (f",url=streamid=1;seq={self.server._audio_rtp_seq};"
+                         f"rtptime={self.server._audio_rtp_ts}")
         resp = (f"RTSP/1.0 200 OK\r\n"
                 f"CSeq: {self._cseq}\r\n"
                 f"Session: {self._session_id}\r\n"
                 f"Range: npt=0.000-\r\n"
-                f"RTP-Info: url=streamid=0;seq={self.server._rtp_seq};"
-                f"rtptime={self.server._rtp_ts}\r\n\r\n")
+                f"RTP-Info: {rtp_info}\r\n\r\n")
         self.writer.write(resp.encode())
         await self.writer.drain()
         log.info("RTSP client started playing")
@@ -3277,11 +3327,18 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
     log.info("Press Ctrl+C to stop.")
 
     try:
-        rediscovery_interval = 30
+        rediscovery_interval = 60
         while True:
             await asyncio.sleep(rediscovery_interval)
-            # Periodic re-discovery for new cameras
-            log.debug("Periodic re-discovery...")
+            # Only probe for new cameras if we don't already have sessions
+            # (probing creates UDP sessions that count against camera user limits)
+            active = sum(1 for s in sessions.values()
+                        if s.state in (STATE_CONNECTED, STATE_STALE))
+            if active >= len(sessions) and len(sessions) > 0:
+                log.debug("All %d cameras active, skipping re-discovery", active)
+                continue
+            log.info("Re-discovering cameras (%d/%d active)...",
+                     active, len(sessions))
             new_cameras = await discover_cameras_broadcast(
                 timeout=min(3, discovery_time), target_ip=target_ip)
             for cam in new_cameras:

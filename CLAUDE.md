@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Single-file Python 3 RTSP proxy for Eye4/VStarcam IP cameras. Discovers cameras on LAN via the proprietary PPPP protocol over UDP, establishes P2P sessions, decrypts H.265/HEVC video + IMA ADPCM audio, and re-serves as standard RTSP streams.
+Single-file Python 3 RTSP proxy for Eye4/VStarcam IP cameras. Discovers cameras on LAN via the proprietary PPPP protocol over UDP, establishes P2P sessions, decrypts H.264/H.265 video + IMA ADPCM audio, and re-serves as standard RTSP streams.
 
 ## Running
 
@@ -49,7 +49,7 @@ Both test files use `eye4.pcap` (real 3-camera capture) as ground truth. No test
 
 ## Architecture
 
-`eye4_rtsp_proxy.py` is a ~2900-line monolithic async script. Key sections in order:
+`eye4_rtsp_proxy.py` is a ~3400-line monolithic async script. Key sections in order:
 
 | Lines | Module | Purpose |
 |-------|--------|---------|
@@ -57,7 +57,7 @@ Both test files use `eye4.pcap` (real 3-camera capture) as ground truth. No test
 | 150-160 | XOR Layer | 4-byte XOR obfuscation for control packets (key: `0x15DB4322`) |
 | 163-241 | P2P Cipher | Stateful stream cipher for DRW data (table-based, PSK-derived) |
 | 243-277 | AES Decrypt | Optional AES-128-ECB video decryption (UID+password derived key) |
-| 278-450 | Audio Codecs | IMA ADPCM decoder, PCM↔G.711 μ-law conversion |
+| 278-450 | Audio Codecs | IMA ADPCM decoder, PCM→G.711 μ-law encoder |
 | 455-540 | Packet Builders | Construct/parse PPPP packets (discovery, punch, DRW, ACK, CGI) |
 | 551-1375 | **PPPPUnifiedProtocol** | Core async UDP handler — discovery, connection, encryption auto-detect, DRW relay |
 | 1376-1596 | Frame Reassembly | VideoReassembly + AudioReassembly — buffer STREAMHEAD-delimited frames |
@@ -69,7 +69,7 @@ Both test files use `eye4.pcap` (real 3-camera capture) as ground truth. No test
 
 - **PPPPUnifiedProtocol** — asyncio DatagramProtocol. Handles one camera's UDP session. Manages encryption state, DRW packet reassembly, ACK generation, and command sending.
 - **CameraSession** — Owns a PPPPUnifiedProtocol + RTSPServer pair. State machine: STOPPED → CONNECTING → CONNECTED ↔ STALE(5s) → OFFLINE(15s) → RECONNECTING.
-- **RTSPServer** — Accepts TCP clients, generates SDP, sends RTP-interleaved H.265 video + G.711 audio. Caches last I-frame for instant playback.
+- **RTSPServer** — Accepts TCP clients, generates SDP, sends RTP-interleaved H.264/H.265 video + G.711 µ-law audio. Caches last I-frame for instant playback.
 - **VideoReassembly / AudioReassembly** — Accumulate DRW payloads, detect STREAMHEAD boundaries (`0x55AA15A8`), emit complete frames.
 
 ### Protocol Stack

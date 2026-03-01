@@ -9,7 +9,7 @@ These cameras have **no native RTSP server** — this proxy bridges the gap.
 - **Auto-discovery**: Finds cameras on the LAN via UDP broadcast (no manual IP configuration needed)
 - **Multi-camera**: Handles multiple cameras simultaneously, each on its own RTSP port
 - **Video**: H.264 and H.265/HEVC, 1080p 30fps
-- **Audio**: IMA ADPCM decoded to PCM L16, plus G.711 a-law/u-law passthrough
+- **Audio**: IMA ADPCM decoded to G.711 µ-law (PCMU), plus G.711 a-law passthrough
 - **Encryption**: Auto-detects P2P cipher mode and PSK per camera
 - **Snapshots**: HTTP endpoint serves JPEG snapshots from cached I-frames (via ffmpeg)
 - **Motion detection**: Polls camera alarm status, triggers webhooks (Scrypted-compatible)
@@ -181,7 +181,7 @@ See [PROTOCOL.md](PROTOCOL.md) for a comprehensive technical reference covering 
 
 ## Architecture
 
-Single-file async Python 3 application (~3400 lines). Key components:
+Single-file async Python 3 application (~3500 lines). Key components:
 
 - **PPPPUnifiedProtocol** — asyncio UDP handler for the PPPP session lifecycle
 - **CameraSession** — Per-camera orchestrator with auto-reconnect state machine
@@ -200,7 +200,7 @@ Camera (UDP) ──→ PPPPUnifiedProtocol ──→ VideoReassembly ──→ R
 
 **Video doesn't start**: Check credentials (`-u`/`-p`). Try `--enc-mode p2p --psk vstarcam2019` explicitly.
 
-**Audio missing**: Audio is requested separately. Some RTSP clients need to explicitly request the audio track. Check with `ffplay rtsp://host:port/`.
+**Audio missing**: Audio is requested separately from the camera. Verify with `ffprobe rtsp://host:port/` — you should see both an H264 video track and a PCMU audio track. For Home Assistant, ensure go2rtc WebRTC is working (HLS fallback has no audio).
 
 **Connection drops**: The proxy auto-reconnects. If drops are frequent, ensure the camera firmware is up to date and the network path is stable.
 

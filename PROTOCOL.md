@@ -540,11 +540,13 @@ for each byte in frame:
 ```
 IMA ADPCM (512 bytes)
   → decode to PCM 16-bit signed LE (1024 samples)
-    → byte-swap LE → BE (network byte order)
-      → RTP L16/8000/1 (payload type 97)
+    → encode to G.711 µ-law (1024 bytes)
+      → RTP PCMU/8000 (payload type 0)
 ```
 
-For G.711 a-law or u-law, the data passes through unchanged to RTP with the appropriate static payload type (8 for PCMA, 0 for PCMU).
+PCMU (static PT 0) is used instead of L16 (dynamic PT 97) because ffmpeg and go2rtc cannot detect L16 over RTSP/TCP interleaved transport. PCMU is universally supported by all RTSP clients, go2rtc, and Home Assistant.
+
+For G.711 a-law or u-law from the camera, the data passes through unchanged to RTP with the appropriate static payload type (8 for PCMA, 0 for PCMU).
 
 ## 12. Critical Behaviors
 
@@ -580,7 +582,11 @@ The proxy sends PUNCH_PKT to all known camera ports (discovery, current, DRW) ev
 
 ### Video Keepalive
 
-If no DRW data is received for 2+ seconds, the proxy re-requests video and audio on the existing session. After 10+ seconds with no data despite 2+ re-requests, it triggers a full reconnect (new UDP socket).
+The camera sends only a few seconds of video per `livestream.cgi` request. The proxy re-requests video every ~1 second of silence to maintain continuous streaming. Audio is re-requested separately if it goes stale for 3+ seconds. The state machine uses relaxed timeouts (STALE at 10s, OFFLINE at 30s) to avoid unnecessary reconnects during brief gaps.
+
+### Batched ACKs
+
+The proxy batches DRW acknowledgements, sending up to 16 indices per ACK packet (matching the Eye4 app's behavior). Command channel (0) ACKs are sent immediately; media channels (1, 2) are batched with a 50ms flush timer to reduce UDP packet overhead.
 
 ---
 
@@ -630,11 +636,13 @@ RTSPServer
 
 | Method   | Behavior |
 |----------|----------|
-| OPTIONS  | Returns `Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN` |
+| OPTIONS  | Returns `Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER` |
 | DESCRIBE | Returns SDP with video + audio media descriptions |
 | SETUP    | Configures RTP/TCP interleaved transport (UDP returns 461) |
 | PLAY     | Starts streaming; triggers audio re-request to camera |
 | TEARDOWN | Stops streaming, closes connection |
+| GET_PARAMETER | Keepalive — returns 200 OK (used by Scrypted, go2rtc) |
+| SET_PARAMETER | Keepalive — returns 200 OK |
 
 ### SDP Generation
 
@@ -651,9 +659,9 @@ c=IN IP4 0.0.0.0
 a=rtpmap:96 H264/90000
 a=fmtp:96 packetization-mode=1;profile-level-id=<from SPS>;sprop-parameter-sets=<SPS_b64>,<PPS_b64>
 a=control:streamid=0
-m=audio 0 RTP/AVP 97
+m=audio 0 RTP/AVP 0
 c=IN IP4 0.0.0.0
-a=rtpmap:97 L16/8000/1
+a=rtpmap:0 PCMU/8000
 a=control:streamid=1
 ```
 
@@ -664,7 +672,7 @@ a=fmtp:96 sprop-vps=<VPS_b64>; sprop-sps=<SPS_b64>; sprop-pps=<PPS_b64>
 ```
 
 Audio SDP varies by detected codec:
-- ADPCM → decoded to L16, dynamic PT 97: `a=rtpmap:97 L16/8000/1`
+- ADPCM → decoded to PCMU, static PT 0: `a=rtpmap:0 PCMU/8000`
 - G.711 a-law: static PT 8, `a=rtpmap:8 PCMA/8000`
 - G.711 u-law: static PT 0, `a=rtpmap:0 PCMU/8000`
 
