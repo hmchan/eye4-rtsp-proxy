@@ -120,16 +120,17 @@ base_port: 9555
 discovery_time: 3
 psk: vstarcam2019
 enc_mode: auto
+log_level: info          # debug, info, warning, error
 motion_cooldown: 30
 motion_poll_interval: 1
 snapshot_bind_addr: 0.0.0.0
 
 # Auto-populated on discovery. Override ports or add webhooks here.
 cameras:
-  VSTJ847204DZPJF:
+  VSTABCDEFGHIJKL:
     port: 9555
     motion_webhook: "http://scrypted:10443/endpoint/@scrypted/webhook/turnOnOff/xyz"
-  VSTJ847204ABCDE: 9556
+  VSTMNOPQRSTUVWX: 9556
 ```
 
 ## Endpoints

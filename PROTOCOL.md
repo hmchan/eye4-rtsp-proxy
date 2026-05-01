@@ -147,7 +147,7 @@ Cameras respond with LAN_NOTIFY containing their 20-byte UID:
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-**UID format**: The 20-byte field may be ASCII (e.g., `VSTJ847204DZPJF\x00...`) or binary. The proxy checks for printable ASCII first; if not ASCII, it falls back to hex encoding for the stable identifier string.
+**UID format**: The 20-byte field may be ASCII (e.g., `VSTABCDEFGHIJKL\x00...`) or binary. The proxy checks for printable ASCII first; if not ASCII, it falls back to hex encoding for the stable identifier string.
 
 **Handshake trigger**: The client echoes the raw LAN_NOTIFY packet back to the camera. This prompts the camera to initiate the PUNCH handshake sequence.
 
@@ -414,8 +414,8 @@ GET /set_factory_param.cgi?alarm_server=http://host:port&loginuse=admin&loginpas
 Camera responses arrive on channel 0 with the same `01 0A` preamble (or as raw continuation text). Responses contain key=value pairs like:
 ```
 result=0
-deviceid=VSTJ847204DZPJF
-realdeviceid=VC0235454WXHW
+deviceid=VSTABCDEFGHIJKL
+realdeviceid=VCXXXXXXXXXXX
 sys_ver=48.88.180.11
 alarm_status=0
 ```
@@ -778,7 +778,7 @@ Motion detection is configured per-camera in the YAML config:
 
 ```yaml
 cameras:
-  VSTJ847204DZPJF:
+  VSTABCDEFGHIJKL:
     port: 9555
     motion_webhook: "http://scrypted:10443/endpoint/@scrypted/webhook/turnOnOff/xyz"
 ```
@@ -916,10 +916,10 @@ Each camera UID in the `cameras` dict can be an integer (port only) or a dict:
 
 ```yaml
 cameras:
-  VSTJ847204DZPJF:
+  VSTABCDEFGHIJKL:
     port: 9555
     motion_webhook: "http://scrypted:10443/endpoint/@scrypted/webhook/turnOnOff/xyz"
-  VSTJ847204ABCDE: 9556   # port only, no motion webhook
+  VSTMNOPQRSTUVWX: 9556   # port only, no motion webhook
 ```
 
 ### CLI Arguments

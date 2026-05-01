@@ -676,7 +676,7 @@ class CameraInfo:
         self.discovery_port = port  # Original port from LAN_NOTIFY
         self.uid_bytes = uid_bytes
         self.uid_hex = uid_bytes.hex()
-        self.uid = uid_from_bytes(uid_bytes)  # Printable UID like "VSTJ847204DZPJF"
+        self.uid = uid_from_bytes(uid_bytes)  # Printable UID like "VSTABCDEFGHIJKL"
 
     def __repr__(self):
         return f"Camera({self.ip}:{self.port} uid={self.uid})"
@@ -1492,11 +1492,12 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     log.info("Audio keepalive: re-requesting audio (audio gap=%.1fs)",
                              now - last_audio)
                     await self._send_start_audio()
-            # If we never received DRW data and session is old, re-request
-            last_drw = getattr(self, '_last_drw_time', 0)
-            if last_drw == 0 and hasattr(self, '_session_start'):
+            # No video yet — re-request. The "video stale" branch above only
+            # fires once last_video > 0, so without this an audio-only DRW
+            # stream silently keeps the session "healthy" forever.
+            if last_video == 0 and hasattr(self, '_session_start'):
                 if now - self._session_start > 5:
-                    log.info("Video keepalive: no data yet, re-requesting...")
+                    log.info("Video keepalive: no video yet, re-requesting...")
                     self._session_start = now  # Reset to avoid spam
                     await self._send_start_video()
                     await self._send_start_audio()

@@ -22,7 +22,7 @@ python3 eye4_rtsp_proxy.py -v
 python3 eye4_rtsp_proxy.py --diag
 
 # Direct camera (skip broadcast discovery)
-python3 eye4_rtsp_proxy.py --target-ip 192.168.40.57
+python3 eye4_rtsp_proxy.py --target-ip 192.168.1.50
 ```
 
 Config file: `/etc/eye4_rtsp_proxy.yml` (YAML, auto-created on first run). CLI args override config values.
