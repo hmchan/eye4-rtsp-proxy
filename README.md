@@ -108,6 +108,7 @@ python3 eye4_rtsp_proxy.py --diag
 | `-v`, `--verbose` | off | Debug logging |
 | `--diag` | off | Network diagnostics only |
 | `--motion-cooldown` | `30` | Seconds to hold motion ON after alarm |
+| `--bind-addr` | `127.0.0.1` | Bind address for RTSP and snapshot servers (use `0.0.0.0` to expose on the LAN) |
 
 ## Configuration
 
@@ -123,7 +124,7 @@ enc_mode: auto
 log_level: info          # debug, info, warning, error
 motion_cooldown: 30
 motion_poll_interval: 1
-snapshot_bind_addr: 0.0.0.0
+bind_addr: 127.0.0.1     # RTSP + snapshot bind address; use 0.0.0.0 to expose on the LAN
 
 # Auto-populated on discovery. Override ports or add webhooks here.
 cameras:

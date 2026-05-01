@@ -97,7 +97,7 @@ DEFAULT_CONFIG = {
     "alarm_server_addr": "",
     "motion_cooldown": 30,
     "motion_poll_interval": 1,
-    "snapshot_bind_addr": "0.0.0.0",
+    "bind_addr": "127.0.0.1",
     "cameras": {},
 }
 
@@ -144,7 +144,7 @@ def save_config(path: str, config: dict):
             # Write scalar settings first
             for key in ["username", "password", "base_port", "discovery_time", "verbose", "log_level", "psk", "enc_mode",
                         "alarm_server_port", "alarm_server_addr", "motion_cooldown", "motion_poll_interval",
-                        "snapshot_bind_addr"]:
+                        "bind_addr"]:
                 if key in data:
                     yaml.dump({key: data[key]}, f, default_flow_style=False)
             # Write camera mappings
@@ -1926,7 +1926,7 @@ class CameraSession:
                  motion_webhook: Optional[str] = None,
                  motion_cooldown: float = 30.0,
                  motion_poll_interval: float = 1.0,
-                 snapshot_bind_addr: str = "0.0.0.0"):
+                 bind_addr: str = "127.0.0.1"):
         self.camera = camera
         self.rtsp_port = rtsp_port
         self.username = username
@@ -1938,7 +1938,7 @@ class CameraSession:
         self.motion_webhook = motion_webhook
         self.motion_cooldown = motion_cooldown
         self.motion_poll_interval = motion_poll_interval
-        self.snapshot_bind_addr = snapshot_bind_addr
+        self.bind_addr = bind_addr
         self.motion_handler: Optional[MotionHandler] = None
 
         self.protocol: Optional[PPPPUnifiedProtocol] = None
@@ -1957,8 +1957,8 @@ class CameraSession:
         log.info("[%s] Starting session on RTSP port %d", self.camera.uid, self.rtsp_port)
 
         # Create RTSP server for this camera
-        self.rtsp = RTSPServer(host="0.0.0.0", port=self.rtsp_port,
-                               snapshot_host=self.snapshot_bind_addr)
+        self.rtsp = RTSPServer(host=self.bind_addr, port=self.rtsp_port,
+                               snapshot_host=self.bind_addr)
         await self.rtsp.start()
 
         # Create protocol and connect
@@ -2050,7 +2050,7 @@ class CameraSession:
 
         self.state = STATE_CONNECTED
         self._last_drw_time = asyncio.get_event_loop().time()
-        log.info("[%s] Connected — RTSP at rtsp://0.0.0.0:%d/", self.camera.uid, self.rtsp_port)
+        log.info("[%s] Connected — RTSP at rtsp://%s:%d/", self.camera.uid, self.bind_addr, self.rtsp_port)
 
     async def stop(self):
         """Clean shutdown."""
@@ -3291,7 +3291,7 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
             motion_webhook=motion_webhook,
             motion_cooldown=float(motion_cooldown),
             motion_poll_interval=float(motion_poll_interval),
-            snapshot_bind_addr=config.get("snapshot_bind_addr", "0.0.0.0"),
+            bind_addr=config.get("bind_addr", "127.0.0.1"),
         )
         sessions[cam.uid] = session
         await session.start()
@@ -3321,7 +3321,7 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
     log.info("=== Proxy Running ===")
     for uid, sess in sessions.items():
         webhook_status = f" [motion→webhook]" if sess.motion_webhook else ""
-        log.info("  %s → rtsp://0.0.0.0:%d/%s", uid, sess.rtsp_port, webhook_status)
+        log.info("  %s → rtsp://%s:%d/%s", uid, sess.bind_addr, sess.rtsp_port, webhook_status)
     webhooks = sum(1 for s in sessions.values() if s.motion_webhook)
     if webhooks:
         log.info("  Motion detection: %d camera(s) polling alarm_status (cooldown=%ds)", webhooks, motion_cooldown)
@@ -3387,6 +3387,9 @@ def main():
                         help="IP address cameras send alarms to (this host's LAN IP)")
     parser.add_argument("--motion-cooldown", type=int, default=None,
                         help="Seconds to keep motion ON after last alarm event")
+    parser.add_argument("--bind-addr", type=str, default=None, dest="bind_addr",
+                        help="Bind address for RTSP and snapshot servers "
+                             "(default 127.0.0.1; use 0.0.0.0 to expose on the LAN)")
     args = parser.parse_args()
 
     # Load config from YAML, then apply CLI overrides
@@ -3412,6 +3415,8 @@ def main():
         config["alarm_server_addr"] = args.alarm_server_addr
     if args.motion_cooldown is not None:
         config["motion_cooldown"] = args.motion_cooldown
+    if args.bind_addr is not None:
+        config["bind_addr"] = args.bind_addr
 
     if args.diag:
         config["verbose"] = True

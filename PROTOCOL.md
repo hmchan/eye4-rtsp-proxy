@@ -724,7 +724,7 @@ Each camera's RTSP server also runs a simple HTTP server on **RTSP port + 1000**
 
 Returns 503 if no I-frame is cached, 500 if ffmpeg conversion fails.
 
-The bind address for the snapshot server is configurable via `snapshot_bind_addr` (default `0.0.0.0`).
+The bind address for the snapshot server (and the RTSP server) is configurable via `bind_addr` (default `127.0.0.1`). Set to `0.0.0.0` to expose on the LAN.
 
 ## 16. Frame Reassembly
 
@@ -907,7 +907,7 @@ Format: YAML. Auto-created on first camera discovery.
 | `alarm_server_addr` | string | `""` | IP:port cameras should send alarms to |
 | `motion_cooldown` | int | `30` | Seconds to keep motion ON after last alarm event |
 | `motion_poll_interval` | int | `1` | Seconds between alarm_status polls |
-| `snapshot_bind_addr` | string | `0.0.0.0` | Bind address for snapshot HTTP server |
+| `bind_addr` | string | `127.0.0.1` | Bind address for RTSP and snapshot HTTP servers (use `0.0.0.0` to expose on the LAN) |
 | `cameras` | dict | `{}` | Camera UID → port mapping (auto-populated) |
 
 ### Camera-Specific Config
@@ -938,6 +938,7 @@ cameras:
 | `--alarm-port` | `alarm_server_port` | Camera alarm HTTP listener port |
 | `--alarm-addr` | `alarm_server_addr` | Alarm listener address |
 | `--motion-cooldown` | `motion_cooldown` | Motion cooldown seconds |
+| `--bind-addr` | `bind_addr` | Bind address for RTSP + snapshot servers (default `127.0.0.1`; use `0.0.0.0` to expose on the LAN) |
 | `--config` | *(none)* | Config file path (default: `/etc/eye4_rtsp_proxy.yml`) |
 
 ### Precedence
