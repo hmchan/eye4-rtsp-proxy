@@ -1061,8 +1061,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                                 self.alarm_callback(status)
 
     def _handle_video_data(self, index: int, payload: bytes):
-        if not payload or not self._video_reassembly:
+        if not payload:
             return
+        if not self._video_reassembly:
+            self._video_reassembly = VideoReassembly(self._on_video_frame)
         self._video_reassembly.feed(index, payload)
 
     def _handle_audio_data(self, index: int, payload: bytes):
@@ -1109,7 +1111,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         """Establish a PPPP session with the specified camera."""
         self._active_camera = camera
         self._running = True
-        self._video_reassembly = VideoReassembly(self._on_video_frame)
+        self._video_reassembly = None
 
         log.info("Connecting to %s (discovery port %d)...", camera, camera.discovery_port)
 
@@ -1510,6 +1512,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         await self._send_cmd(cgi)
 
     async def _send_start_video(self):
+        # Camera restarts video DRW indices from 0 on each fresh request, so
+        # clear the dedup set and reorder buffer (otherwise new index-0
+        # packets would be dropped as duplicates / classified as "old").
+        if CH_VIDEO in self._seen_drw_indices:
+            self._seen_drw_indices[CH_VIDEO].clear()
+        self._drw_high_water[CH_VIDEO] = -1
+        self._video_reassembly = None
         # streamid=10 = main stream (H.264, 1080p)
         cgi = (f"GET /livestream.cgi?"
                f"streamid=10&substream=1"
@@ -1631,7 +1640,18 @@ class VideoReassembly:
     """
     Reassemble DRW video fragments into complete video frames.
     Looks for STREAMHEAD markers (55 AA 15 A8) to identify frame boundaries.
+
+    Includes a reorder buffer keyed by DRW index. H.264 CABAC has no resync
+    points within a slice, so even one out-of-order byte derails the
+    arithmetic decoder for the rest of the slice. The window is generous
+    (vs audio's 8) because video slices span many DRW packets and the
+    burstiness from large frames can stretch reorder distance. When the
+    window overflows we discard the in-progress frame so we don't emit a
+    corrupt slice that would derail downstream decoders — the next IDR
+    resyncs.
     """
+
+    REORDER_WINDOW = 64
 
     def __init__(self, frame_callback):
         self.frame_callback = frame_callback
@@ -1643,6 +1663,10 @@ class VideoReassembly:
         self._current_frame_data = bytearray()
         self._in_frame = False
         self._frames_received = 0
+        self._reorder_buf: dict[int, bytes] = {}
+        self._next_expected_idx: Optional[int] = None
+        self._gap_count = 0
+        self._frames_dropped = 0
 
     def _compact(self):
         """Compact buffer when offset gets large to avoid unbounded growth."""
@@ -1651,6 +1675,49 @@ class VideoReassembly:
             self._off = 0
 
     def feed(self, index: int, data: bytes):
+        if self._next_expected_idx is None:
+            self._next_expected_idx = index
+
+        if index == self._next_expected_idx:
+            self._feed_ordered(data)
+            self._next_expected_idx = (self._next_expected_idx + 1) & 0xFFFF
+            self._flush_reorder_buf()
+        elif ((index - self._next_expected_idx) & 0xFFFF) < 0x8000:
+            # Future packet within forward half of 16-bit range: buffer it
+            self._reorder_buf[index] = data
+            if len(self._reorder_buf) >= self.REORDER_WINDOW:
+                self._handle_gap()
+        # else: old/duplicate (deduped upstream — ignore here too)
+
+    def _flush_reorder_buf(self):
+        while self._next_expected_idx in self._reorder_buf:
+            data = self._reorder_buf.pop(self._next_expected_idx)
+            self._feed_ordered(data)
+            self._next_expected_idx = (self._next_expected_idx + 1) & 0xFFFF
+
+    def _handle_gap(self):
+        if not self._reorder_buf:
+            return
+        self._gap_count += 1
+        min_idx = min(self._reorder_buf.keys(),
+                      key=lambda i: (i - self._next_expected_idx) & 0xFFFF)
+        gap_size = (min_idx - self._next_expected_idx) & 0xFFFF
+        if self._gap_count <= 10 or self._gap_count % 100 == 0:
+            log.info("Video DRW gap #%d: lost %d packet(s) (idx %d→%d)",
+                     self._gap_count, gap_size,
+                     self._next_expected_idx, min_idx)
+        # Discard in-progress frame and any stray buffer bytes — CABAC
+        # cannot recover from missing bytes mid-slice.
+        if self._in_frame or self._buffer:
+            self._frames_dropped += 1
+            self._in_frame = False
+            self._current_frame_data = bytearray()
+            self._buffer = bytearray()
+            self._off = 0
+        self._next_expected_idx = min_idx
+        self._flush_reorder_buf()
+
+    def _feed_ordered(self, data: bytes):
         self._buffer.extend(data)
         self._parse_buffer()
 
