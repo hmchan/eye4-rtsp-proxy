@@ -89,7 +89,6 @@ DEFAULT_CONFIG = {
     "password": "888888",
     "base_port": 9555,
     "discovery_time": 3,
-    "verbose": False,
     "log_level": "info",
     "psk": "vstarcam2019",
     "enc_mode": "auto",
@@ -142,7 +141,7 @@ def save_config(path: str, config: dict):
             f.write("# Eye4 Camera RTSP Proxy Configuration\n")
             f.write("# Auto-generated — edit as needed\n\n")
             # Write scalar settings first
-            for key in ["username", "password", "base_port", "discovery_time", "verbose", "log_level", "psk", "enc_mode",
+            for key in ["username", "password", "base_port", "discovery_time", "log_level", "psk", "enc_mode",
                         "alarm_server_port", "alarm_server_addr", "motion_cooldown", "motion_poll_interval",
                         "bind_addr"]:
                 if key in data:
@@ -3470,8 +3469,6 @@ def main():
         config["base_port"] = args.base_port
     if args.discovery_time is not None:
         config["discovery_time"] = args.discovery_time
-    if args.verbose:
-        config["verbose"] = True
     if args.psk is not None:
         config["psk"] = args.psk
     if args.enc_mode is not None:
@@ -3485,13 +3482,12 @@ def main():
     if args.bind_addr is not None:
         config["bind_addr"] = args.bind_addr
 
-    if args.diag:
-        config["verbose"] = True
-
-    # Determine log level: verbose flag → DEBUG, else log_level config, else INFO
-    _log_level_str = config.get("log_level", "info").upper()
-    if config.get("verbose"):
+    # Determine log level. -v / --diag force DEBUG for this run only (not
+    # persisted). Otherwise honor the YAML log_level setting.
+    if args.verbose or args.diag:
         _log_level_str = "DEBUG"
+    else:
+        _log_level_str = config.get("log_level", "info").upper()
     _log_level = getattr(logging, _log_level_str, logging.INFO)
     logging.basicConfig(
         level=_log_level,
