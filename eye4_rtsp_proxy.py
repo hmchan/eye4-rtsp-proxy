@@ -160,10 +160,12 @@ def save_config(path: str, config: dict):
                         "alarm_server_port", "alarm_server_addr", "motion_cooldown", "motion_poll_interval",
                         "bind_addr", "extra_broadcasts"]:
                 if key in data:
-                    yaml.dump({key: data[key]}, f, default_flow_style=False)
+                    yaml.dump({key: data[key]}, f, default_flow_style=False,
+                              allow_unicode=True)
             # Write camera mappings
             f.write("\n# Camera UID → RTSP port mappings (auto-populated on discovery)\n")
-            yaml.dump({"cameras": data.get("cameras", {})}, f, default_flow_style=False)
+            yaml.dump({"cameras": data.get("cameras", {})}, f, default_flow_style=False,
+                      allow_unicode=True)
         try:
             _os.chmod(path, 0o600)  # tighten perms on pre-existing files too
         except OSError:
@@ -708,6 +710,7 @@ class CameraInfo:
         self.uid_bytes = uid_bytes
         self.uid_hex = uid_bytes.hex()
         self.uid = uid_from_bytes(uid_bytes)  # Printable UID like "VSTABCDEFGHIJKL"
+        self.label = self.uid  # Display label — "uid (name)" once config name is known
 
     def __repr__(self):
         return f"Camera({self.ip}:{self.port} uid={self.uid})"
@@ -2065,7 +2068,7 @@ class CameraSession:
         """Create protocol, RTSP server, connect to camera."""
         self._running = True
         self.state = STATE_CONNECTING
-        log.info("[%s] Starting session on RTSP port %d", self.camera.uid, self.rtsp_port)
+        log.info("[%s] Starting session on RTSP port %d", self.camera.label, self.rtsp_port)
 
         # Create RTSP server for this camera
         self.rtsp = RTSPServer(host=self.bind_addr, port=self.rtsp_port,
@@ -2103,7 +2106,7 @@ class CameraSession:
         if self.motion_webhook:
             if not self.motion_handler:
                 self.motion_handler = MotionHandler(
-                    uid=self.camera.uid, webhook=self.motion_webhook,
+                    uid=self.camera.label, webhook=self.motion_webhook,
                     cooldown=self.motion_cooldown)
             self.protocol.alarm_callback = self.motion_handler.on_alarm_status
             self.protocol.alarm_poll_interval = self.motion_poll_interval
@@ -2161,7 +2164,7 @@ class CameraSession:
 
         self.state = STATE_CONNECTED
         self._last_drw_time = asyncio.get_event_loop().time()
-        log.info("[%s] Connected — RTSP at rtsp://%s:%d/", self.camera.uid, self.bind_addr, self.rtsp_port)
+        log.info("[%s] Connected — RTSP at rtsp://%s:%d/", self.camera.label, self.bind_addr, self.rtsp_port)
 
     async def stop(self):
         """Clean shutdown."""
@@ -2179,7 +2182,7 @@ class CameraSession:
             await self.protocol.stop()
         if self.rtsp:
             await self.rtsp.stop()
-        log.info("[%s] Session stopped", self.camera.uid)
+        log.info("[%s] Session stopped", self.camera.label)
 
     async def _teardown_protocol(self):
         """Tear down protocol+transport without stopping RTSP server."""
@@ -2211,13 +2214,13 @@ class CameraSession:
 
             if self.state == STATE_CONNECTED:
                 if gap > 30:
-                    log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.uid, gap)
+                    log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.label, gap)
                     self.state = STATE_OFFLINE
                     stale_logged = False
                 elif gap > 10:
                     if not stale_logged:
                         log.info("[%s] No data for %.0fs — STALE, re-requesting video",
-                                 self.camera.uid, gap)
+                                 self.camera.label, gap)
                         stale_logged = True
                     self.state = STATE_STALE
                     if self.protocol and self.protocol.enc_mode:
@@ -2229,15 +2232,15 @@ class CameraSession:
 
             elif self.state == STATE_STALE:
                 if gap <= 5:
-                    log.info("[%s] Video resumed — CONNECTED", self.camera.uid)
+                    log.info("[%s] Video resumed — CONNECTED", self.camera.label)
                     self.state = STATE_CONNECTED
                     stale_logged = False
                 elif gap > 30:
-                    log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.uid, gap)
+                    log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.label, gap)
                     self.state = STATE_OFFLINE
 
             elif self.state == STATE_OFFLINE:
-                log.info("[%s] Tearing down stale session, entering RECONNECTING", self.camera.uid)
+                log.info("[%s] Tearing down stale session, entering RECONNECTING", self.camera.label)
                 await self._teardown_protocol()
                 # Clear cached I-frame so Scrypted doesn't serve a stale snapshot
                 if self.rtsp:
@@ -2247,26 +2250,26 @@ class CameraSession:
                 # and stagger reconnects across cameras
                 import random
                 jitter = random.uniform(5, 15)
-                log.info("[%s] Waiting %.0fs before reconnect attempt...", self.camera.uid, jitter)
+                log.info("[%s] Waiting %.0fs before reconnect attempt...", self.camera.label, jitter)
                 await asyncio.sleep(jitter)
 
             elif self.state == STATE_RECONNECTING:
-                log.info("[%s] Attempting reconnect to %s...", self.camera.uid, self.camera.ip)
+                log.info("[%s] Attempting reconnect to %s...", self.camera.label, self.camera.ip)
                 try:
                     await self._attempt_reconnect()
                 except Exception as e:
-                    log.warning("[%s] Reconnect failed: %s — retrying in 15s", self.camera.uid, e)
+                    log.warning("[%s] Reconnect failed: %s — retrying in 15s", self.camera.label, e)
                     await asyncio.sleep(10)  # Extra backoff (total ~15s with loop sleep)
 
     async def _attempt_reconnect(self):
         """Try to reconnect to the camera using its last known address.
         Avoids creating probe sessions that count against camera's user limit."""
         log.info("[%s] Reconnecting directly to %s (no probe)...",
-                 self.camera.uid, self.camera.ip)
+                 self.camera.label, self.camera.ip)
         try:
             await self._create_and_connect()
         except Exception as e:
-            log.warning("[%s] Direct reconnect failed: %s", self.camera.uid, e)
+            log.warning("[%s] Direct reconnect failed: %s", self.camera.label, e)
 
 
 # =============================================================================
@@ -3496,19 +3499,25 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
             # Already have a session — update IP if changed
             existing = sessions[cam.uid]
             if existing.camera.ip != cam.ip:
-                log.info("[%s] IP changed %s → %s", cam.uid, existing.camera.ip, cam.ip)
+                log.info("[%s] IP changed %s → %s", existing.camera.label,
+                         existing.camera.ip, cam.ip)
                 existing.camera.ip = cam.ip
                 existing.camera.port = cam.port
                 existing.camera.discovery_port = cam.discovery_port
             return
 
+        # Look up per-camera settings (name, motion_webhook) from config
+        cam_cfg = camera_configs.get(cam.uid, {})
+        if not isinstance(cam_cfg, dict):
+            cam_cfg = {}
+        cam_name = cam_cfg.get("name")
+        if cam_name:
+            cam.label = f"{cam.uid} ({cam_name})"
+        motion_webhook = cam_cfg.get("motion_webhook")
+
         port = assign_port(config, cam.uid, base_port)
         save_config(config_path, config)
-        log.info("[%s] Assigned RTSP port %d", cam.uid, port)
-
-        # Look up per-camera motion_webhook from config
-        cam_cfg = camera_configs.get(cam.uid, {})
-        motion_webhook = cam_cfg.get("motion_webhook") if isinstance(cam_cfg, dict) else None
+        log.info("[%s] Assigned RTSP port %d", cam.label, port)
 
         session = CameraSession(
             camera=cam, rtsp_port=port,
@@ -3548,7 +3557,8 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
     log.info("=== Proxy Running ===")
     for uid, sess in sessions.items():
         webhook_status = f" [motion→webhook]" if sess.motion_webhook else ""
-        log.info("  %s → rtsp://%s:%d/%s", uid, sess.bind_addr, sess.rtsp_port, webhook_status)
+        log.info("  %s → rtsp://%s:%d/%s", sess.camera.label, sess.bind_addr,
+                 sess.rtsp_port, webhook_status)
     webhooks = sum(1 for s in sessions.values() if s.motion_webhook)
     if webhooks:
         log.info("  Motion detection: %d camera(s) polling alarm_status (cooldown=%ds)", webhooks, motion_cooldown)

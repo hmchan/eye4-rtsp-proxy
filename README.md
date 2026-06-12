@@ -126,10 +126,11 @@ motion_cooldown: 30
 motion_poll_interval: 1
 bind_addr: 127.0.0.1     # RTSP + snapshot bind address; use 0.0.0.0 to expose on the LAN
 
-# Auto-populated on discovery. Override ports or add webhooks here.
+# Auto-populated on discovery. Override ports, add names or webhooks here.
 cameras:
   VSTABCDEFGHIJKL:
     port: 9555
+    name: Living Room      # optional friendly name, shown next to the UID in logs
     motion_webhook: "http://scrypted:10443/endpoint/@scrypted/webhook/turnOnOff/xyz"
   VSTMNOPQRSTUVWX: 9556
 ```
