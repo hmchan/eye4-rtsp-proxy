@@ -196,6 +196,22 @@ Camera (UDP) ──→ PPPPUnifiedProtocol ──→ VideoReassembly ──→ R
                                      ──→ AudioReassembly ──→
 ```
 
+## Security Notes
+
+The PPPP camera protocol itself is weak, and the proxy cannot fix that:
+
+- Camera credentials are sent in cleartext CGI strings over UDP to the camera.
+- The XOR and "P2P_Proprietary" ciphers are obfuscation, not encryption — anyone capturing LAN traffic can decode the streams.
+- Discovery and punch packets are unauthenticated, so any LAN host can impersonate a camera.
+
+Mitigations the proxy does provide:
+
+- RTSP and snapshot servers bind to `127.0.0.1` by default. They have **no authentication** — if you set `bind_addr: 0.0.0.0`, anyone who can reach those ports can view the cameras. Front them with go2rtc/Scrypted or a firewall instead.
+- The config file (which contains camera credentials) is written with `0600` permissions, and credentials are redacted from log output.
+- The snapshot endpoint caches the encoded JPEG (~1 s) and caps concurrent ffmpeg encodes.
+
+The strongest practical mitigation is network segregation: put the cameras on an isolated VLAN with no internet access, with only the proxy host able to reach them.
+
 ## Troubleshooting
 
 **No cameras found**: Run `--diag` to test network connectivity. Ensure the proxy host is on the same subnet as the cameras. Try `--target-ip <camera_ip>`.

@@ -19,6 +19,7 @@ import hashlib
 import logging
 import random
 import re
+import secrets
 import socket
 import struct
 import time
@@ -75,6 +76,17 @@ except Exception:
     _accel = None
 
 HAS_ACCEL = _accel is not None
+
+# Optional symbol — older eye4_accel.so builds don't have it; the rest of
+# the accelerator still works without it.
+_accel_ulaw = None
+if _accel is not None:
+    try:
+        _accel.pcm16_to_ulaw.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+        _accel.pcm16_to_ulaw.restype = None
+        _accel_ulaw = _accel.pcm16_to_ulaw
+    except AttributeError:
+        pass
 
 log = logging.getLogger("eye4")
 
@@ -138,7 +150,9 @@ def save_config(path: str, config: dict):
         for key in DEFAULT_CONFIG:
             if key in config:
                 data[key] = config[key]
-        with open(path, "w") as f:
+        # 0o600 — the file contains camera credentials
+        fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+        with _os.fdopen(fd, "w") as f:
             f.write("# Eye4 Camera RTSP Proxy Configuration\n")
             f.write("# Auto-generated — edit as needed\n\n")
             # Write scalar settings first
@@ -150,11 +164,23 @@ def save_config(path: str, config: dict):
             # Write camera mappings
             f.write("\n# Camera UID → RTSP port mappings (auto-populated on discovery)\n")
             yaml.dump({"cameras": data.get("cameras", {})}, f, default_flow_style=False)
+        try:
+            _os.chmod(path, 0o600)  # tighten perms on pre-existing files too
+        except OSError:
+            pass
         log.info("Saved config to %s", path)
     except PermissionError:
         log.warning("Permission denied writing %s — try running as root or change --config path", path)
     except Exception as e:
         log.warning("Error saving config to %s: %s", path, e)
+
+
+_CRED_PARAM_RE = re.compile(r'(loginpas|pwd)=[^&\s]*')
+
+
+def redact_credentials(text: str) -> str:
+    """Mask password values in CGI command strings before logging."""
+    return _CRED_PARAM_RE.sub(r'\1=***', text)
 
 
 def _get_camera_port(cam_cfg) -> Optional[int]:
@@ -297,7 +323,7 @@ def p2p_proprietary_decrypt(key4: bytes, data: bytes) -> bytes:
         n = len(data)
         buf = _get_p2p_buf(n)
         _accel.p2p_decrypt(merged, data, buf, n)
-        return buf.raw[:n]
+        return ctypes.string_at(buf, n)
     # Python fallback
     if k not in _p2p_table_cache:
         _p2p_table_cache[k] = _build_p2p_tables(key4)
@@ -320,7 +346,7 @@ def p2p_proprietary_encrypt(key4: bytes, data: bytes) -> bytes:
         n = len(data)
         buf = _get_p2p_buf(n)
         _accel.p2p_encrypt(merged, data, buf, n)
-        return buf.raw[:n]
+        return ctypes.string_at(buf, n)
     # Python fallback
     if k not in _p2p_table_cache:
         _p2p_table_cache[k] = _build_p2p_tables(key4)
@@ -538,8 +564,13 @@ _PCM_TO_ULAW = _build_pcm_to_ulaw_table()
 
 def pcm16le_to_ulaw(pcm_data: bytes) -> bytes:
     """Convert PCM 16-bit LE to G.711 mu-law. Returns half the bytes."""
+    n = len(pcm_data) // 2
+    if _accel_ulaw is not None:
+        buf = ctypes.create_string_buffer(n)
+        _accel_ulaw(pcm_data, buf, n)
+        return ctypes.string_at(buf, n)
     table = _PCM_TO_ULAW
-    out = bytearray(len(pcm_data) // 2)
+    out = bytearray(n)
     for i in range(0, len(pcm_data) - 1, 2):
         # Convert LE 16-bit signed to unsigned 16-bit table index
         idx = pcm_data[i] | (pcm_data[i + 1] << 8)
@@ -1613,7 +1644,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             lvl = logging.DEBUG if "get_status.cgi" in cgi_text else logging.INFO
             log.log(lvl, "Sending DRW CMD (%s) to %s:%d idx=%d cgi=%s",
                     self.enc_mode, addr[0], addr[1],
-                    self._cmd_index - 1, cgi_text[:60])
+                    self._cmd_index - 1, redact_credentials(cgi_text)[:80])
             self.transport.sendto(pkt, addr)
 
     # --- PSK auto-detection ---
@@ -1807,6 +1838,7 @@ class AudioReassembly:
     def __init__(self, frame_callback):
         self.frame_callback = frame_callback  # callback(pcm_data: bytes, codec: str)
         self._buffer = bytearray()
+        self._off = 0  # current read offset into _buffer
         self._in_frame = False
         self._current_frame_len = 0
         self._current_frame_data = bytearray()
@@ -1861,10 +1893,11 @@ class AudioReassembly:
             log.info("Audio DRW gap #%d: lost %d packet(s) (idx %d→%d)",
                      self._gap_count, gap_size, self._next_expected_idx, min_idx)
         # If we were mid-frame, discard partial data to avoid corrupt audio
-        if self._in_frame:
+        if self._in_frame or self._buffer:
             self._in_frame = False
             self._current_frame_data = bytearray()
-            self._buffer.clear()
+            self._buffer = bytearray()
+            self._off = 0
         self._next_expected_idx = min_idx
         self._flush_reorder_buf()
 
@@ -1873,56 +1906,67 @@ class AudioReassembly:
         self._buffer.extend(data)
         self._parse_buffer()
 
+    def _compact(self):
+        """Compact buffer when offset gets large to avoid unbounded growth."""
+        if self._off > 65536:
+            del self._buffer[:self._off]
+            self._off = 0
+
     def _parse_buffer(self):
-        while len(self._buffer) > 0:
+        buf = self._buffer
+        while True:
+            avail = len(buf) - self._off
+            if avail <= 0 and not self._in_frame:
+                self._compact()
+                return
             if not self._in_frame:
-                idx = self._buffer.find(b"\x55\xAA\x15\xA8")
-                if idx == 0 and len(self._buffer) >= STREAMHEAD_SIZE:
-                    # Read codec byte from STREAMHEAD offset 5
-                    codec_byte = self._buffer[5]
-                    if self._wire_codec_byte is None:
-                        self._wire_codec_byte = codec_byte
-                        codec_name = {
-                            AUDIO_CODEC_PCM: "PCM",
-                            AUDIO_CODEC_ADPCM: "IMA ADPCM",
-                            AUDIO_CODEC_G711A: "G.711 a-law",
-                            AUDIO_CODEC_G711U: "G.711 u-law",
-                        }.get(codec_byte, f"unknown(0x{codec_byte:02X})")
-                        log.info("Audio STREAMHEAD codec byte=0x%02X → %s",
-                                 codec_byte, codec_name)
-                    self._current_frame_len = struct.unpack_from("<I", self._buffer, 16)[0]
-                    self._buffer = self._buffer[STREAMHEAD_SIZE:]
-                    self._current_frame_data = bytearray()
-                    self._in_frame = True
-                    continue
-                elif idx > 0:
-                    # Data before STREAMHEAD — discard it (orphan data from
-                    # partial frames or corruption). Don't decode as audio —
-                    # it would produce clicks/ticks.
-                    log.debug("Audio: discarding %d orphan bytes before STREAMHEAD", idx)
-                    self._buffer = self._buffer[idx:]
-                    continue
-                elif idx < 0:
-                    # No STREAMHEAD found — keep last 3 bytes (potential partial magic)
+                idx = buf.find(b"\x55\xAA\x15\xA8", self._off)
+                if idx < 0:
+                    # No STREAMHEAD — keep last 3 bytes (potential partial magic).
                     # Don't emit this data as audio.
-                    if len(self._buffer) > 3:
+                    if avail > 3:
                         log.debug("Audio: discarding %d bytes (no STREAMHEAD found)",
-                                  len(self._buffer) - 3)
-                        self._buffer = self._buffer[-3:]
+                                  avail - 3)
+                        self._off = len(buf) - 3
+                    self._compact()
                     return
-                else:
+                if idx > self._off:
+                    # Orphan data before STREAMHEAD (partial frames or
+                    # corruption) — skip it, decoding it would produce clicks.
+                    log.debug("Audio: discarding %d orphan bytes before STREAMHEAD",
+                              idx - self._off)
+                    self._off = idx
+                if len(buf) - self._off < STREAMHEAD_SIZE:
+                    self._compact()
                     return
+                # Read codec byte from STREAMHEAD offset 5
+                codec_byte = buf[self._off + 5]
+                if self._wire_codec_byte is None:
+                    self._wire_codec_byte = codec_byte
+                    codec_name = {
+                        AUDIO_CODEC_PCM: "PCM",
+                        AUDIO_CODEC_ADPCM: "IMA ADPCM",
+                        AUDIO_CODEC_G711A: "G.711 a-law",
+                        AUDIO_CODEC_G711U: "G.711 u-law",
+                    }.get(codec_byte, f"unknown(0x{codec_byte:02X})")
+                    log.info("Audio STREAMHEAD codec byte=0x%02X → %s",
+                             codec_byte, codec_name)
+                self._current_frame_len = struct.unpack_from("<I", buf, self._off + 16)[0]
+                self._off += STREAMHEAD_SIZE
+                self._current_frame_data = bytearray()
+                self._in_frame = True
 
             if self._in_frame:
                 remaining = self._current_frame_len - len(self._current_frame_data)
                 if remaining <= 0:
                     self._emit_frame()
                     continue
-                available = min(remaining, len(self._buffer))
-                if available == 0:
+                take = min(remaining, len(buf) - self._off)
+                if take == 0:
+                    self._compact()
                     return
-                self._current_frame_data.extend(self._buffer[:available])
-                self._buffer = self._buffer[available:]
+                self._current_frame_data.extend(buf[self._off:self._off + take])
+                self._off += take
                 if len(self._current_frame_data) >= self._current_frame_len:
                     self._emit_frame()
 
@@ -2247,7 +2291,7 @@ class RTSPServer:
         self._codec: Optional[str] = None  # "h264" or "h265"
         self._rtp_seq = 0
         self._rtp_ts = 0
-        self._ssrc = random.randint(0, 0xFFFFFFFF)
+        self._ssrc = secrets.randbits(32)
         self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=300)
         self._sender_task: Optional[asyncio.Task] = None
         self._running = False
@@ -2256,7 +2300,7 @@ class RTSPServer:
         self._audio_codec: Optional[str] = None  # AUDIO_PCM_L16, AUDIO_PCMA, AUDIO_PCMU
         self._audio_rtp_seq = 0
         self._audio_rtp_ts = 0
-        self._audio_ssrc = random.randint(0, 0xFFFFFFFF)
+        self._audio_ssrc = secrets.randbits(32)
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=300)
         self._audio_sender_task: Optional[asyncio.Task] = None
         self._audio_packets_received = 0
@@ -2264,6 +2308,11 @@ class RTSPServer:
         self.audio_frames_sent = 0
         # Cached last I-frame for instant start of new clients
         self._cached_iframe: Optional[bytes] = None
+        # Snapshot endpoint: bound concurrency and cache the encoded JPEG
+        self._snapshot_server: Optional[asyncio.Server] = None
+        self._snapshot_sem = asyncio.Semaphore(2)
+        self._snapshot_cache: Optional[tuple[float, bytes]] = None  # (time, jpeg)
+        self.SNAPSHOT_CACHE_TTL = 1.0
 
     async def start(self):
         self._running = True
@@ -2299,35 +2348,22 @@ class RTSPServer:
                                       writer: asyncio.StreamWriter):
         """Serve /snapshot.jpg — convert cached I-frame to JPEG via ffmpeg."""
         try:
-            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+            raw = await asyncio.wait_for(reader.read(2048), timeout=5.0)
             if not raw:
                 return
 
-            if not self._cached_iframe or not self._sps or not self._pps:
-                writer.write(b"HTTP/1.0 503 No Frame\r\nContent-Length: 0\r\n\r\n")
+            # Only answer GET /snapshot.jpg (or /snapshot) — anything else is 404
+            request_line = raw.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+            parts = request_line.split()
+            path = parts[1].split("?", 1)[0] if len(parts) >= 2 else ""
+            if len(parts) < 2 or parts[0] != "GET" or path not in ("/snapshot.jpg", "/snapshot"):
+                writer.write(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
                 return
 
-            # Build raw H.264 byte stream: SPS + PPS + IDR frame
-            start_code = b'\x00\x00\x00\x01'
-            h264_data = start_code + self._sps + start_code + self._pps + self._cached_iframe
-
-            # Pipe through ffmpeg to get JPEG
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "h264", "-i", "pipe:0",
-                "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg",
-                "-q:v", "5", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            jpeg_data, stderr = await asyncio.wait_for(
-                proc.communicate(input=h264_data), timeout=5.0)
-
-            if proc.returncode != 0 or not jpeg_data:
-                log.warning("Snapshot ffmpeg failed: %s", stderr.decode(errors="replace")[:200])
-                writer.write(b"HTTP/1.0 500 Conversion Failed\r\nContent-Length: 0\r\n\r\n")
+            jpeg_data = await self._get_snapshot_jpeg()
+            if jpeg_data is None:
+                writer.write(b"HTTP/1.0 503 No Frame\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
                 return
 
@@ -2342,6 +2378,52 @@ class RTSPServer:
             log.warning("Snapshot request error: %s", e)
         finally:
             writer.close()
+
+    async def _get_snapshot_jpeg(self) -> Optional[bytes]:
+        """Return the current snapshot JPEG, encoding at most once per TTL.
+        Concurrency is bounded so request floods can't fork unbounded ffmpeg."""
+        now = asyncio.get_event_loop().time()
+        cache = self._snapshot_cache
+        if cache and now - cache[0] < self.SNAPSHOT_CACHE_TTL:
+            return cache[1]
+
+        async with self._snapshot_sem:
+            # Re-check: another request may have refreshed while we waited
+            now = asyncio.get_event_loop().time()
+            cache = self._snapshot_cache
+            if cache and now - cache[0] < self.SNAPSHOT_CACHE_TTL:
+                return cache[1]
+
+            if not self._cached_iframe or not self._sps or not self._pps:
+                return None
+
+            # Build raw H.264 byte stream: SPS + PPS + IDR frame
+            start_code = b'\x00\x00\x00\x01'
+            h264_data = start_code + self._sps + start_code + self._pps + self._cached_iframe
+
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "h264", "-i", "pipe:0",
+                "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg",
+                "-q:v", "5", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                jpeg_data, stderr = await asyncio.wait_for(
+                    proc.communicate(input=h264_data), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                log.warning("Snapshot ffmpeg timed out")
+                return None
+
+            if proc.returncode != 0 or not jpeg_data:
+                log.warning("Snapshot ffmpeg failed: %s", stderr.decode(errors="replace")[:200])
+                return None
+
+            self._snapshot_cache = (asyncio.get_event_loop().time(), jpeg_data)
+            return jpeg_data
 
     def push_video_frame(self, frame_type: int, timestamp: int, data: bytes):
         if frame_type == FRAME_I or frame_type == 0:
@@ -2459,8 +2541,13 @@ class RTSPServer:
             all_packets.extend(self._packetize_nal(nal))
         if not all_packets:
             return
-        for client in clients:
-            await client.send_rtp_batch(all_packets)
+        # Concurrent fan-out: one slow client must not stall the others
+        if len(clients) == 1:
+            await clients[0].send_rtp_batch(all_packets)
+        else:
+            await asyncio.gather(
+                *(c.send_rtp_batch(all_packets) for c in clients),
+                return_exceptions=True)
 
     async def _frame_sender(self):
         while self._running:
@@ -2530,14 +2617,20 @@ class RTSPServer:
             # Packetize audio into RTP — one packet per audio chunk
             # G.711 (PCMU/PCMA) = 1 byte per sample, no byte-swap needed
             MAX_AUDIO_RTP = 1400
+            packets = []
             offset = 0
             while offset < len(data):
                 chunk = data[offset:offset + MAX_AUDIO_RTP]
                 offset += MAX_AUDIO_RTP
                 marker = (offset >= len(data))
-                rtp = self._build_audio_rtp_header(marker=marker) + chunk
-                for client in playing_clients:
-                    await client.send_audio_rtp(rtp)
+                packets.append(self._build_audio_rtp_header(marker=marker) + chunk)
+            # Concurrent fan-out, single drain per client
+            if len(playing_clients) == 1:
+                await playing_clients[0].send_audio_rtp_batch(packets)
+            else:
+                await asyncio.gather(
+                    *(c.send_audio_rtp_batch(packets) for c in playing_clients),
+                    return_exceptions=True)
 
             # Advance audio timestamp by number of samples
             # G.711 = 1 byte per sample; L16 = 2 bytes per sample (fallback)
@@ -2758,7 +2851,7 @@ class RTSPClient:
         self.audio_setup = False  # True after audio SETUP
         self.got_iframe = False  # True after first I-frame sent to this client
         self._cseq = 0
-        self._session_id = f"{random.randint(10000000, 99999999)}"
+        self._session_id = f"{secrets.randbelow(90000000) + 10000000}"
         self._setup_count = 0  # Track which SETUP this is (0=video, 1=audio)
 
     def close(self):
@@ -2788,11 +2881,15 @@ class RTSPClient:
                 hline = hline.decode("utf-8", errors="replace").strip()
                 if not hline:
                     break
-                if ":" in hline:
+                # Cap stored headers so a malicious client can't grow memory
+                if ":" in hline and len(headers) < 64:
                     key, val = hline.split(":", 1)
                     headers[key.strip()] = val.strip()
 
-            self._cseq = int(headers.get("CSeq", "0"))
+            try:
+                self._cseq = int(headers.get("CSeq", "0").strip())
+            except ValueError:
+                self._cseq = 0
 
             if method == "OPTIONS":
                 await self._send_options()
@@ -2845,6 +2942,23 @@ class RTSPClient:
                 self.playing = False
             except asyncio.TimeoutError:
                 log.warning("RTP drain timeout — dropping slow client")
+                self.playing = False
+
+    async def send_audio_rtp_batch(self, rtp_packets: list):
+        """Send multiple audio RTP packets with a single drain() call."""
+        if not self.playing or not self.audio_setup or self.writer.is_closing():
+            return
+        if self.interleaved:
+            ch = bytes([self.audio_rtp_channel])
+            try:
+                for pkt in rtp_packets:
+                    header = struct.pack("!BcH", 0x24, ch, len(pkt))
+                    self.writer.write(header + pkt)
+                await asyncio.wait_for(self.writer.drain(), timeout=2.0)
+            except (ConnectionError, OSError):
+                self.playing = False
+            except asyncio.TimeoutError:
+                log.warning("Audio RTP drain timeout — dropping slow client")
                 self.playing = False
 
     async def send_audio_rtp(self, rtp_packet: bytes):
@@ -3358,6 +3472,11 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
     password = config.get("password", DEFAULT_CONFIG["password"])
     discovery_time = config.get("discovery_time", DEFAULT_CONFIG["discovery_time"])
 
+    bind_addr = config.get("bind_addr", "127.0.0.1")
+    if bind_addr not in ("127.0.0.1", "localhost", "::1"):
+        log.warning("bind_addr=%s — RTSP and snapshot servers have NO authentication; "
+                    "anyone who can reach these ports can view the cameras", bind_addr)
+
     # Alarm/motion settings
     alarm_port = config.get("alarm_server_port", 0)
     alarm_addr = config.get("alarm_server_addr", "")
@@ -3544,7 +3663,9 @@ def main():
     )
 
     log.info("C accelerator: %s", "loaded" if HAS_ACCEL else "not available (pure Python fallback)")
-    log.info("Config: %s (from %s + CLI overrides)", {k: v for k, v in config.items() if k != "cameras"}, args.config)
+    log.info("Config: %s (from %s + CLI overrides)",
+             {k: ("***" if k in ("password", "psk") and v else v)
+              for k, v in config.items() if k != "cameras"}, args.config)
     if config.get("cameras"):
         log.info("Known cameras: %s", config["cameras"])
 

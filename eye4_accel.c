@@ -91,6 +91,33 @@ void decode_adpcm(const uint8_t *data, int len, int16_t *out) {
     }
 }
 
+/* ── PCM16 → G.711 µ-law ────────────────────────────────────────────────── */
+
+/*
+ * Convert signed 16-bit LE PCM samples to G.711 µ-law (ITU-T G.711).
+ * out must have room for n_samples bytes.
+ */
+void pcm16_to_ulaw(const int16_t *in, uint8_t *out, int n_samples) {
+    const int BIAS = 0x84;
+    const int CLIP = 32635;
+    for (int i = 0; i < n_samples; i++) {
+        int sample = in[i];
+        int sign = 0;
+        if (sample < 0) {
+            sign = 0x80;
+            sample = -sample;
+        }
+        if (sample > CLIP) sample = CLIP;
+        sample += BIAS;
+        int exp = 7;
+        for (; exp > 0; exp--) {
+            if (sample & (1 << (exp + 7))) break;
+        }
+        int mantissa = (sample >> (exp + 3)) & 0x0F;
+        out[i] = (uint8_t)(~(sign | (exp << 4) | mantissa) & 0xFF);
+    }
+}
+
 /* ── 16-bit byte swap ───────────────────────────────────────────────────── */
 
 /*
