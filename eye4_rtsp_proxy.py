@@ -97,6 +97,7 @@ DEFAULT_CONFIG = {
     "motion_cooldown": 30,
     "motion_poll_interval": 1,
     "bind_addr": "127.0.0.1",
+    "extra_broadcasts": [],
     "cameras": {},
 }
 
@@ -143,7 +144,7 @@ def save_config(path: str, config: dict):
             # Write scalar settings first
             for key in ["username", "password", "base_port", "discovery_time", "log_level", "psk", "enc_mode",
                         "alarm_server_port", "alarm_server_addr", "motion_cooldown", "motion_poll_interval",
-                        "bind_addr"]:
+                        "bind_addr", "extra_broadcasts"]:
                 if key in data:
                     yaml.dump({key: data[key]}, f, default_flow_style=False)
             # Write camera mappings
@@ -2972,6 +2973,36 @@ class RTSPClient:
 # Module 9: LAN Discovery
 # =============================================================================
 
+# Extra subnet broadcast targets from config (extra_broadcasts key), set in main()
+EXTRA_BROADCASTS: list[str] = []
+
+
+def _linux_interface_broadcasts() -> list[tuple[str, str, str]]:
+    """Enumerate (iface, ip, broadcast) for all IPv4 interfaces via ioctl.
+
+    Pure-Python alternative to netifaces; Linux only (SIOCGIFADDR/SIOCGIFBRDADDR).
+    """
+    import fcntl
+    import struct
+    results = []
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _idx, name in socket.if_nameindex():
+            try:
+                ifreq = struct.pack("256s", name.encode()[:15])
+                ip = socket.inet_ntoa(
+                    fcntl.ioctl(s.fileno(), 0x8915, ifreq)[20:24])   # SIOCGIFADDR
+                bcast = socket.inet_ntoa(
+                    fcntl.ioctl(s.fileno(), 0x8919, ifreq)[20:24])   # SIOCGIFBRDADDR
+            except OSError:
+                continue  # interface has no IPv4 address
+            if bcast and bcast != "0.0.0.0" and not ip.startswith("127."):
+                results.append((name, ip, bcast))
+    finally:
+        s.close()
+    return results
+
+
 def get_broadcast_addresses() -> list[str]:
     broadcasts = ["255.255.255.255"]
     if HAS_NETIFACES:
@@ -2988,7 +3019,18 @@ def get_broadcast_addresses() -> list[str]:
         except Exception as e:
             log.warning("netifaces error: %s", e)
     else:
-        log.info("  netifaces not installed — using fallback")
+        try:
+            for iface, ip, bcast in _linux_interface_broadcasts():
+                if bcast not in broadcasts:
+                    broadcasts.append(bcast)
+                    log.info("  Interface %s: ip=%s broadcast=%s", iface, ip, bcast)
+        except Exception as e:
+            log.info("  Interface enumeration unavailable (%s) — using fallback", e)
+
+    for bcast in EXTRA_BROADCASTS:
+        if bcast not in broadcasts:
+            broadcasts.append(bcast)
+            log.info("  Extra broadcast (config): %s", bcast)
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -3481,6 +3523,12 @@ def main():
         config["motion_cooldown"] = args.motion_cooldown
     if args.bind_addr is not None:
         config["bind_addr"] = args.bind_addr
+
+    # Extra subnet broadcasts for discovery (e.g. VLANs without netifaces)
+    extra = config.get("extra_broadcasts") or []
+    if isinstance(extra, str):
+        extra = [extra]
+    EXTRA_BROADCASTS[:] = [str(b) for b in extra]
 
     # Determine log level. -v / --diag force DEBUG for this run only (not
     # persisted). Otherwise honor the YAML log_level setting.
