@@ -772,6 +772,28 @@ When `alarm_status` changes from 0 to non-zero:
 
 The webhook URL is designed for Scrypted virtual motion sensor integration but works with any HTTP endpoint that accepts POST to `turnOn`/`turnOff` paths.
 
+### Why not camera push? (`alarm_server_*`)
+
+The camera *can* be told to push alarms to a server via
+`set_factory_param.cgi?alarm_server=http://host:port`, which would avoid polling.
+This is **deliberately not implemented**, and the `alarm_server_port` /
+`alarm_server_addr` config keys are inert. Reasons:
+
+1. **Push wire format is undocumented and unverified.** Only the enabling CGI is
+   known; what the camera actually sends to the URL on motion (method, path,
+   body, or even whether it is HTTP) has never been captured. A listener would
+   be built blind.
+2. **`set_factory_param.cgi` writes persistent factory params.** A wrong value
+   can corrupt the camera's notification config (and the Eye4 app's cloud push),
+   on firmware we have no spec for.
+3. **Polling already works** for all cameras; push would only save ~1 s latency.
+4. **Multi-subnet:** a single `alarm_server_addr` cannot serve cameras on
+   different subnets (each must push to the proxy's IP *on that subnet*); it
+   would require per-camera source-IP detection.
+
+To revive it: first point `alarm_server` at a raw TCP/HTTP sink, trigger motion,
+capture and decode the real push format, *then* build the matching listener.
+
 ### Configuration
 
 Motion detection is configured per-camera in the YAML config:
@@ -903,8 +925,8 @@ Format: YAML. Auto-created on first camera discovery.
 | `log_level` | string | `info` | Log level: debug, info, warning, error |
 | `psk` | string | `vstarcam2019` | P2P pre-shared key for encryption |
 | `enc_mode` | string | `auto` | Encryption mode: `auto`, `p2p`, or `xor` |
-| `alarm_server_port` | int | `0` | HTTP port for camera alarm listener (0 = disabled) |
-| `alarm_server_addr` | string | `""` | IP:port cameras should send alarms to |
+| `alarm_server_port` | int | `0` | **INERT** — reserved for a future camera-push listener (see [Motion Detection](#17-motion-detection)). Does nothing today. |
+| `alarm_server_addr` | string | `""` | **INERT** — see above. Motion uses polling, not push. |
 | `motion_cooldown` | int | `30` | Seconds to keep motion ON after last alarm event |
 | `motion_poll_interval` | int | `1` | Seconds between alarm_status polls |
 | `bind_addr` | string | `127.0.0.1` | Bind address for RTSP and snapshot HTTP servers (use `0.0.0.0` to expose on the LAN) |

@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     "log_level": "info",
     "psk": "vstarcam2019",
     "enc_mode": "auto",
+    # NOTE: alarm_server_* are INERT — see the "Camera-push alarms" note above
+    # _send_set_alarm_server(). Motion detection runs via polling (motion_webhook).
     "alarm_server_port": 0,
     "alarm_server_addr": "",
     "motion_cooldown": 30,
@@ -1208,7 +1210,9 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         await asyncio.sleep(0.3)
         await self._send_start_audio()
 
-        # Redirect alarm notifications to our local HTTP listener
+        # Camera-push alarms are intentionally disabled — alarm_server_addr is
+        # always None in normal operation. See the note above
+        # _send_set_alarm_server(). Motion runs via polling instead.
         if self.alarm_server_addr:
             await asyncio.sleep(0.3)
             await self._send_set_alarm_server(self.alarm_server_addr)
@@ -1579,8 +1583,38 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         log.info("Requesting audio stream...")
         await self._send_cmd(cgi)
 
+    # =========================================================================
+    # Camera-push alarms — INTENTIONALLY NOT WIRED UP. Do not "fix" this by
+    # enabling the call below without first doing the work described here.
+    #
+    # The idea: tell the camera (set_factory_param.cgi?alarm_server=URL) to push
+    # motion alarms to an HTTP listener we run, instead of us polling for them.
+    # We deliberately keep POLLING (MotionHandler + _alarm_poll_loop, wired via
+    # per-camera `motion_webhook`) because the push path is not safely buildable:
+    #
+    #   1. The push WIRE FORMAT is undocumented and unverified. PROTOCOL.md only
+    #      documents the enabling CGI, not what the camera actually sends to the
+    #      URL on motion (method/path/body, or whether it's even HTTP). No pcap
+    #      of a real alarm push exists, so a listener would be built blind.
+    #   2. set_factory_param.cgi mutates PERSISTENT factory params on the camera.
+    #      A wrong value can corrupt its notification config (and the Eye4 app's
+    #      own cloud push) — hard to reverse, on firmware we don't have specs for.
+    #   3. Polling already works in production for all cameras; push only saves
+    #      ~1s of latency.
+    #   4. Multi-subnet: a single alarm_server_addr can't serve both subnets — a
+    #      VLAN camera (192.168.101.x) must push to 192.168.101.20, a LAN camera
+    #      to 192.168.40.20. Would need per-camera source-IP detection
+    #      (socket.getsockname() after connecting to the camera).
+    #
+    # To revive this: first capture a camera actually pushing an alarm to a
+    # server you control (point alarm_server at a netcat/HTTP sink and trigger
+    # motion), decode that format, THEN build the matching listener. The config
+    # keys alarm_server_port/alarm_server_addr are kept only as the eventual
+    # home for that work; they currently do nothing.
+    # =========================================================================
     async def _send_set_alarm_server(self, alarm_server_addr: str):
-        """Redirect camera alarm notifications to our local HTTP listener."""
+        """UNUSED — see the note above. Camera expects a full URL (http://host:port),
+        not a bare address; left intact only for reference."""
         cgi = (f"GET /set_factory_param.cgi?alarm_server={alarm_server_addr}"
                f"&loginuse={self.username}&loginpas={self.password}"
                f"&user={self.username}&pwd={self.password}&")
@@ -3480,9 +3514,13 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
         log.warning("bind_addr=%s — RTSP and snapshot servers have NO authentication; "
                     "anyone who can reach these ports can view the cameras", bind_addr)
 
-    # Alarm/motion settings
-    alarm_port = config.get("alarm_server_port", 0)
-    alarm_addr = config.get("alarm_server_addr", "")
+    # Motion settings. NOTE: alarm_server_port/alarm_server_addr are read here
+    # only for completeness — they are INERT (no push listener is started and
+    # CameraSession is created with alarm_server_addr=None below). Motion uses
+    # polling via per-camera motion_webhook. See the note above
+    # PPPPUnifiedProtocol._send_set_alarm_server() for why push isn't wired up.
+    alarm_port = config.get("alarm_server_port", 0)  # unused (see note)
+    alarm_addr = config.get("alarm_server_addr", "")  # unused (see note)
     motion_cooldown = config.get("motion_cooldown", 30)
     motion_poll_interval = config.get("motion_poll_interval", 1)
     camera_configs = config.get("cameras", {})
@@ -3523,7 +3561,7 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
             camera=cam, rtsp_port=port,
             username=username, password=password,
             p2p_key=p2p_key, psk_list=psk_list, enc_mode=enc_mode,
-            alarm_server_addr=None,
+            alarm_server_addr=None,  # push alarms disabled — see _send_set_alarm_server note
             motion_webhook=motion_webhook,
             motion_cooldown=float(motion_cooldown),
             motion_poll_interval=float(motion_poll_interval),
